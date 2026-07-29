@@ -472,10 +472,8 @@ def extract_qoi(p, k, edges, gamma_out):
     Q = 0.0
     for (i, j) in edges:
         k_e = k.get((i,j), k.get((j,i), 1.0))
-        if i in gamma_out_set:
-            Q += k_e * (p[i] - p[j])
-        elif j in gamma_out_set:
-            Q += k_e * (p[j] - p[i])
+        if i in gamma_out_set or j in gamma_out_set:
+            Q += k_e * abs(p[i] - p[j])
     return Q
 
 
@@ -830,22 +828,29 @@ def visualize_graph_3d_plotly(edges, n_vertices, edge_weights=None, title="Graph
     """
     Interactive 3D graph visualization using Plotly.
     Fully rotatable — drag to explore the graph structure.
+    Node size and color reflect degree.
     """
     G = nx.Graph()
     G.add_nodes_from(range(n_vertices))
     G.add_edges_from(edges)
 
     degrees = dict(G.degree())
-    pos_2d  = nx.spring_layout(G, seed=42, k=2)
-    np.random.seed(42)
-    pos_3d  = {v: (pos_2d[v][0], pos_2d[v][1], np.random.uniform(-1, 1))
-               for v in G.nodes()}
 
-    # Edge traces
+    # 3D spring layout using networkx 2D + spectral for z
+    pos_2d = nx.spring_layout(G, seed=42, k=2)
+    
+    # use second eigenvector of laplacian for z coordinate (more meaningful than random)
+    L_mat   = nx.laplacian_matrix(G).toarray().astype(float)
+    eigvals, eigvecs = np.linalg.eigh(L_mat)
+    z_coord = eigvecs[:, 1]  # Fiedler vector — captures graph structure in z
+
+    pos_3d = {v: (pos_2d[v][0], pos_2d[v][1], z_coord[v]) for v in G.nodes()}
+
+    # edge traces
     edge_x, edge_y, edge_z = [], [], []
     for (i, j) in G.edges():
-        x0,y0,z0 = pos_3d[i]
-        x1,y1,z1 = pos_3d[j]
+        x0, y0, z0 = pos_3d[i]
+        x1, y1, z1 = pos_3d[j]
         edge_x += [x0, x1, None]
         edge_y += [y0, y1, None]
         edge_z += [z0, z1, None]
@@ -853,46 +858,67 @@ def visualize_graph_3d_plotly(edges, n_vertices, edge_weights=None, title="Graph
     edge_trace = go.Scatter3d(
         x=edge_x, y=edge_y, z=edge_z,
         mode='lines',
-        line=dict(width=1, color='rgba(255,255,255,0.2)'),
-        hoverinfo='none'
+        line=dict(width=1, color='rgba(255,255,255,0.3)'),
+        hoverinfo='none',
+        showlegend=False
     )
 
-    # Node traces
+    # node traces
     node_x       = [pos_3d[v][0] for v in G.nodes()]
     node_y       = [pos_3d[v][1] for v in G.nodes()]
     node_z       = [pos_3d[v][2] for v in G.nodes()]
-    node_degrees = [degrees[v] for v in G.nodes()]
+    node_degrees = np.array([degrees[v] for v in G.nodes()])
+    node_sizes = [3 + degrees[v] * 0.5 for v in G.nodes()]
     node_text    = [f"Vertex {v}<br>Degree: {degrees[v]}" for v in G.nodes()]
-    node_sizes   = [4 + degrees[v] * 2 for v in G.nodes()]
 
     node_trace = go.Scatter3d(
         x=node_x, y=node_y, z=node_z,
-        mode='markers',
+        mode='markers+text' if n_vertices <= 50 else 'markers',
         hoverinfo='text',
-        text=node_text,
+        text=[str(v) for v in G.nodes()] if n_vertices <= 50 else None,
+        hovertext=node_text,
         marker=dict(
             size=node_sizes,
             color=node_degrees,
-            colorscale='Plasma',
+            colorscale='Viridis',
+            cmin=min(node_degrees),
+            cmax=max(node_degrees),
             showscale=True,
-            colorbar=dict(title="Degree", thickness=15),
-            line=dict(width=0.3, color='white')
-        )
+            colorbar=dict(
+                title=dict(text="Degree", font=dict(color="white")),
+                tickfont=dict(color="white"),
+                thickness=15
+            ),
+            line=dict(width=0.5, color='white'),
+            opacity=0.9
+        ),
+    showlegend=False
     )
 
-    fig = go.Figure(data=[edge_trace, node_trace],
+    plotly_fig = go.Figure(
+        data=[edge_trace, node_trace],
         layout=go.Layout(
             title=dict(text=title, font=dict(color='white', size=16)),
             paper_bgcolor='#0f1117',
+            height=800,
+            width=1200,
             scene=dict(
                 xaxis=dict(showgrid=False, zeroline=False,
-                           showticklabels=False, backgroundcolor='#0f1117'),
+                           showticklabels=False, backgroundcolor='#0f1117',
+                           showspikes=False),
                 yaxis=dict(showgrid=False, zeroline=False,
-                           showticklabels=False, backgroundcolor='#0f1117'),
+                           showticklabels=False, backgroundcolor='#0f1117',
+                           showspikes=False),
                 zaxis=dict(showgrid=False, zeroline=False,
-                           showticklabels=False, backgroundcolor='#0f1117'),
+                           showticklabels=False, backgroundcolor='#0f1117',
+                           showspikes=False),
+                bgcolor='#0f1117',
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                )
             ),
             margin=dict(l=0, r=0, t=50, b=0)
         )
     )
-    fig.show()
+    plotly_fig.show()
+    return plotly_fig
