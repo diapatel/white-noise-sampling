@@ -57,16 +57,16 @@ Compute λ⁺_min, the smallest positive eigenvalue of D⁻¹L, and form the shi
 Generate a spatially correlated random field u on the vertices via three steps:
 - Draw independent N(0,1) noise w_e for every edge
 - Map to vertices: f = B @ w (B = signed incidence matrix)
-- Solve: Lσ u = λ⁺_min f (Cholesky factorized once, reused every MC step)
+- Solve: $$\lambda^+_{\min} f$$ (Cholesky factorized once, reused every MC step)
 
 **Phase 4 — Edge Permeability**  
-Convert vertex field u to edge permeabilities: k_e = exp((u_i + u_j) / 2). Ensures k_e > 0 always (log-normal distribution).
+Convert vertex field u to edge permeabilities: $$k_e = \exp\left(\frac{u_i + u_j}{2}\right)$$. Ensures k_e > 0 always (log-normal distribution).
 
 **Phase 5 — Darcy Flow Solve**  
-Build weighted Laplacian L_k = Σ k_e d_e d_eᵀ and solve the flow problem with boundary conditions p = 1 on Γ_in and p = 0 on Γ_out.
+Build weighted Laplacian $$L_k = \sum_e k_e \mathbf{d}_e \mathbf{d}_e^T$$ and solve the flow problem with boundary conditions p = 1 on Γ_in and p = 0 on Γ_out.
 
 **Phase 6 — Quantity of Interest**  
-Extract Q = Σ k_e (p_i - p_j) over outlet edges — total flux exiting through Γ_out.
+Extract $$Q = \sum_{e=(i,j) \in \Gamma_{out}} k_e (p_i - p_j)$$ over outlet edges — total flux exiting through Γ_out.
 
 **Phase 7 — Monte Carlo Loop**  
 Repeat Phases 3-6 N = 1000 times. Analyze the distribution of Q: mean, variance, and convergence.
