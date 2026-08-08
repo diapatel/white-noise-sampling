@@ -23,7 +23,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.linalg import eigh, cho_factor, cho_solve
 from scipy.io import mmread
-
+from tqdm import tqdm
+from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
 
 # =============================================================================
 # DATA LOADING
@@ -382,47 +384,37 @@ def compute_permeability(u, edges, edge_weights=None):
 
 def build_weighted_laplacian(edges, n_vertices, k):
     """
-    Build the weighted Laplacian L_k = sum_e k_e * d_e * d_e^T.
-    Same structure as L but edge contributions scaled by permeability k_e.
+    Build the weighted graph Laplacian L_k = sum_e k_e * d_e * d_e^T
+    using sparse matrix format for efficiency.
+
+    Same structure as L from Phase 1 but each edge contributes
+    proportionally to its permeability k_e rather than uniformly.
+    High permeability edges dominate, low permeability edges barely
+    contribute. Stored in CSR format for fast arithmetic and solving.
 
     Parameters
     ----------
     edges      : list of (i, j) tuples
     n_vertices : int
-    k          : dict of {(i,j): k_e} — from Phase 4
+    k          : dict of {(i,j): k_e} — permeabilities from Phase 4
 
     Returns
     -------
-    L_k : np.ndarray (n x n)
+    L_k : scipy.sparse.csr_matrix (n x n)
     """
-    L_k = np.zeros((n_vertices, n_vertices))
+    L_k = lil_matrix((n_vertices, n_vertices))
     for (i, j) in edges:
         k_e = k.get((i,j), k.get((j,i), 1.0))
         L_k[i, i] += k_e
         L_k[j, j] += k_e
         L_k[i, j] -= k_e
         L_k[j, i] -= k_e
-    return L_k
+    return L_k.tocsr()
 
 
 def solve_darcy(L_k, n_vertices, gamma_in, gamma_out, p_in=1.0, p_out=0.0):
     """
-    Solve the Darcy flow problem L_k p = b with boundary conditions.
-    Prescribed pressure p_in on gamma_in, p_out on gamma_out.
-    Interior vertices are solved via the reduced system.
-
-    Parameters
-    ----------
-    L_k       : np.ndarray (n x n) — weighted Laplacian from Phase 5
-    n_vertices: int
-    gamma_in  : list of int — inlet vertex indices
-    gamma_out : list of int — outlet vertex indices
-    p_in      : float — inlet pressure (default 1.0)
-    p_out     : float — outlet pressure (default 0.0)
-
-    Returns
-    -------
-    p : np.ndarray (n_vertices,) — pressure at every vertex
+    Solve Darcy flow using efficient sparse matrix slicing.
     """
     p = np.zeros(n_vertices)
     for v in gamma_in:
@@ -431,22 +423,16 @@ def solve_darcy(L_k, n_vertices, gamma_in, gamma_out, p_in=1.0, p_out=0.0):
         p[v] = p_out
 
     boundary = set(gamma_in) | set(gamma_out)
-    interior = [v for v in range(n_vertices) if v not in boundary]
+    interior = np.array([v for v in range(n_vertices) if v not in boundary])
 
-    L_interior = L_k[np.ix_(interior, interior)]
-    L_boundary = L_k[np.ix_(interior, list(boundary))]
-    p_boundary = p[list(boundary)]
-    rhs        = -L_boundary @ p_boundary
-    p_interior = np.linalg.solve(L_interior, rhs)
+    # efficient sparse slicing — avoid np.ix_ on sparse matrices
+    L_interior = L_k[interior, :][:, interior]
+    rhs        = -L_k[interior, :][:, list(boundary)] @ p[list(boundary)]
 
-    for idx, v in enumerate(interior):
-        p[v] = p_interior[idx]
+    p_interior = spsolve(L_interior, rhs)
+    p[interior] = p_interior
 
-    print("✓ Phase 5 complete: pressure field solved")
-    print(f"  pressure range: [{p.min():.4f}, {p.max():.4f}]")
-    print()
     return p
-
 
 # =============================================================================
 # PHASE 6: Quantity of Interest
