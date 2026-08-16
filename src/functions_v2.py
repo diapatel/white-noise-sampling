@@ -16,14 +16,17 @@
 
 from tqdm import tqdm
 import networkx as nx
+import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.linalg import eigh, cho_factor, cho_solve
 from scipy.io import mmread
-from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse import lil_matrix, csr_matrix, coo_matrix
 from scipy.sparse.linalg import spsolve, cg
 import pyamg
-
+from scipy.sparse import lil_matrix, diags
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
 
 # =============================================================================
 # DATA LOADING
@@ -32,7 +35,8 @@ import pyamg
 def load_graph(filepath):
     """
     Load a graph from either a Matrix Market (.mtx) file or a plain edge list.
-    Automatically detects format and whether edges are weighted.
+    Automatically detects format, delimiter (whitespace or comma), and whether
+    edges are weighted.
 
     Parameters
     ----------
@@ -65,16 +69,47 @@ def load_graph(filepath):
         edge_weights = {}
         max_vertex = 0
         weighted = None
+        delimiter = None  # auto-detected on first data line: ',' or None (whitespace)
+        zero_indexed = None  # auto-detected from a '%% n_nodes n_edges' style header
 
         with open(filepath, 'r') as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('%') or line.startswith('#'):
+                if not line:
                     continue
-                parts = line.split()
+
+                # Header/comment lines: '%', '#', or '%%' (but not '%%MatrixMarket',
+                # already handled above). A '%% <n_vertices> <n_edges>' style header
+                # (seen in files like bio-grid-human.edges) gives us vertex count directly.
+                if line.startswith('%') or line.startswith('#'):
+                    header_parts = line.lstrip('%#').split()
+                    if len(header_parts) == 2 and all(p.isdigit() for p in header_parts):
+                        # e.g. '%% 9527 62364' -> n_vertices, n_edges hint
+                        max_vertex = max(max_vertex, int(header_parts[0]) - 1)
+                    continue
+
+                # Detect delimiter once, from the first real data line
+                if delimiter is None:
+                    delimiter = ',' if (',' in line and len(line.split()) == 1) else None
+
+                parts = line.split(delimiter) if delimiter else line.split()
+                parts = [p.strip() for p in parts if p.strip() != '']
+
                 if weighted is None:
                     weighted = len(parts) == 3
-                i, j = int(parts[0]) - 1, int(parts[1]) - 1
+
+                i_raw, j_raw = int(parts[0]), int(parts[1])
+
+                # Detect 0- vs 1-indexing once: if we ever see a literal 0, the file
+                # is already 0-indexed and must NOT be shifted down by 1.
+                if zero_indexed is None:
+                    zero_indexed = (i_raw == 0 or j_raw == 0)
+
+                if zero_indexed:
+                    i, j = i_raw, j_raw
+                else:
+                    i, j = i_raw - 1, j_raw - 1
+
                 if i == j:
                     continue
                 i, j = min(i, j), max(i, j)
@@ -120,7 +155,7 @@ def build_graph_matrices(edges, n_vertices, edge_weights=None):
     D : scipy.sparse.csr_matrix (n x n) — diagonal degree matrix
     L : scipy.sparse.csr_matrix (n x n) — graph Laplacian
     """
-    from scipy.sparse import lil_matrix, diags
+    
 
     A = lil_matrix((n_vertices, n_vertices))
 
@@ -335,55 +370,62 @@ def compute_permeability(u, edges, edge_weights=None):
 
 def build_weighted_laplacian(edges, n_vertices, k):
     """
-    Build weighted Laplacian L_k using COO format for fast construction
-    then convert to CSR for solving.
+    Build the weighted graph Laplacian L_k from edge permeabilities.
+
+    L_k = sum_{e=(i,j)} k_e * b_e * b_e^T
+
+    Each edge (i,j) with permeability k_e contributes:
+        L_k[i,i] += k_e,  L_k[j,j] += k_e,
+        L_k[i,j] -= k_e,  L_k[j,i] -= k_e
+
+    Built in COO format for efficiency (fast bulk construction), then
+    converted to CSR for downstream solves.
+
+    Parameters
+    ----------
+    edges      : list of (i, j) tuples
+    n_vertices : int
+    k          : dict of {(i,j): k_e} — edge permeabilities from Phase 4
+
+    Returns
+    -------
+    L_k : scipy.sparse.csr_matrix (n_vertices x n_vertices)
     """
-    from scipy.sparse import coo_matrix
+    edges_arr = np.array(edges)
+    i_arr = edges_arr[:, 0]
+    j_arr = edges_arr[:, 1]
 
-    n_edges = len(edges)
-    rows = []
-    cols = []
-    data = []
+    k_vals = np.array([k.get((i, j), k.get((j, i), 0.0)) for i, j in edges])
 
-    for (i, j) in edges:
-        k_e = k.get((i,j), k.get((j,i), 1.0))
-        # diagonal entries
-        rows += [i, j]
-        cols += [i, j]
-        data += [k_e, k_e]
-        # off-diagonal entries
-        rows += [i, j]
-        cols += [j, i]
-        data += [-k_e, -k_e]
+    if np.any(k_vals <= 0):
+        raise ValueError(
+            f"Found {np.sum(k_vals <= 0)} non-positive permeability value(s) — "
+            f"all k_e must be > 0 for a physically valid Darcy flow problem."
+        )
 
-    L_k = coo_matrix((data, (rows, cols)),
-                     shape=(n_vertices, n_vertices))
-    return L_k.tocsr()
+    row_idx = np.concatenate([i_arr, j_arr, i_arr, j_arr])
+    col_idx = np.concatenate([i_arr, j_arr, j_arr, i_arr])
+    diag_data = np.concatenate([k_vals, k_vals])
+    offdiag_data = np.concatenate([-k_vals, -k_vals])
+    data = np.concatenate([diag_data, offdiag_data])
 
+    L_k = coo_matrix((data, (row_idx, col_idx)),
+                      shape=(n_vertices, n_vertices)).tocsr()
 
-def sanity_check_weighted_laplacian(L_k, k, n_vertices):
-    """
-    Sanity checks for the weighted Laplacian L_k.
-
-    Checks:
-    1. L_k is symmetric
-    2. All permeabilities k_e are positive
-    3. Row sums of L_k are zero
-    """
-    print("=== Weighted Laplacian Sanity Checks ===")
-
-    assert np.allclose(L_k.toarray(), L_k.toarray().T), "L_k is not symmetric!"
-    print("✓ L_k is symmetric")
-
-    assert all(v > 0 for v in k.values()), "Negative permeability detected!"
-    print(f"✓ All k_e > 0")
-    print(f"  min k_e : {min(k.values()):.4f}")
-    print(f"  max k_e : {max(k.values()):.4f}")
-
+    # Sanity checks — cheap relative to the solve, catch structural bugs early
     row_sums = np.array(L_k.sum(axis=1)).flatten()
-    assert np.allclose(row_sums, 0, atol=1e-10), "Row sums of L_k are not zero!"
-    print("✓ Row sums of L_k are zero")
-    print()
+    if not np.allclose(row_sums, 0, atol=1e-8):
+        raise ValueError(
+            f"L_k row sums are not zero (max deviation: {np.abs(row_sums).max():.2e}) — "
+            f"this violates the graph Laplacian structural invariant."
+        )
+    if (L_k != L_k.T).nnz > 0:
+        raise ValueError("L_k is not symmetric — check edge list for duplicate/conflicting entries.")
+
+    return L_k
+
+
+
 
 
 # =============================================================================
@@ -393,10 +435,10 @@ def sanity_check_weighted_laplacian(L_k, k, n_vertices):
 # AMG is better for very large graphs (>50000 nodes)
 # =============================================================================
 
-def solve_darcy(L_k, n_vertices, gamma_in, gamma_out, p_in=1.0, p_out=0.0):
+def solve_darcy(L_k, n_vertices, gamma_in, gamma_out, p_in=1.0, p_out=0.0, debug=True):
     """
-    Solve the Darcy flow problem L_k p = b using sparse direct solver.
-    Recommended for graphs up to ~10,000 nodes.
+    Solve Darcy flow: fix pressure at gamma_in (p_in) and gamma_out (p_out),
+    solve for pressure at all interior vertices.
 
     Parameters
     ----------
@@ -406,23 +448,52 @@ def solve_darcy(L_k, n_vertices, gamma_in, gamma_out, p_in=1.0, p_out=0.0):
     gamma_out : list of int — outlet vertex indices (p = p_out)
     p_in      : float — inlet pressure (default 1.0)
     p_out     : float — outlet pressure (default 0.0)
+    debug     : bool — if True, run NaN/Inf and maximum-principle sanity checks
 
     Returns
     -------
     p : np.ndarray (n_vertices,) — pressure at every vertex
     """
+    boundary = set(gamma_in) | set(gamma_out)
+    interior = np.array([v for v in range(n_vertices) if v not in boundary])
+
+    if len(interior) == 0:
+        raise ValueError("No interior vertices — gamma_in and gamma_out cover the entire graph.")
+
+    p_boundary = np.zeros(n_vertices)
+    for v in gamma_in:
+        p_boundary[v] = p_in
+    for v in gamma_out:
+        p_boundary[v] = p_out
+
+    L_interior = L_k[interior, :][:, interior]
+    rhs        = -L_k[interior, :][:, list(boundary)] @ p_boundary[list(boundary)]
+
+    p_interior = spsolve(L_interior, rhs)
+
+    if debug:
+        if np.any(np.isnan(p_interior)) or np.any(np.isinf(p_interior)):
+            raise ValueError(
+                "solve_darcy: NaN/Inf in interior pressures — check L_interior for "
+                "singularity (possible disconnected interior region)."
+            )
+
     p = np.zeros(n_vertices)
+    p[interior] = p_interior
     for v in gamma_in:
         p[v] = p_in
     for v in gamma_out:
         p[v] = p_out
 
-    boundary = set(gamma_in) | set(gamma_out)
-    interior = np.array([v for v in range(n_vertices) if v not in boundary])
-
-    L_interior = L_k[interior, :][:, interior].tocsr()
-    rhs        = -L_k[interior, :][:, list(boundary)] @ p[list(boundary)]
-    p[interior] = spsolve(L_interior, rhs)
+    if debug:
+        lo, hi = min(p_in, p_out), max(p_in, p_out)
+        tol = 1e-8
+        if p[interior].min() < lo - tol or p[interior].max() > hi + tol:
+            raise ValueError(
+                f"solve_darcy: pressure out of physical bounds "
+                f"[min={p[interior].min():.6f}, max={p[interior].max():.6f}] — "
+                f"expected range [{lo}, {hi}]."
+            )
 
     return p
 
@@ -505,33 +576,40 @@ def extract_qoi(p, k, edges, gamma_out):
 
 def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
                           gamma_in, gamma_out, edge_weights=None,
-                          N=1000, use_amg=False):
-    from tqdm.notebook import tqdm
-    from scipy.sparse import coo_matrix, csr_matrix
-    from scipy.sparse.linalg import spsolve
+                          N=1000, use_amg=False, debug=True):
+    """
+    Run the full Monte Carlo Darcy flow pipeline (Phases 3-6) N times.
+
+    Parameters
+    ----------
+    ... (existing params)
+    debug : bool — if True (default), runs sanity checks each sample:
+            (1) NaN/Inf check on the solved interior pressures,
+            (2) maximum-principle bounds check (p in [0,1]).
+            Set to False to skip these checks for a faster production run
+            once correctness has been validated on a given dataset.
+    """
 
     # precompute once
     B         = build_incidence_matrix(edges, n_vertices)
     cho_cache = cho_factor(L_sigma)
     Q_samples = np.zeros(N)
-
     # precompute edge arrays for vectorized permeability
     edges_arr = np.array(edges)
     i_arr     = edges_arr[:, 0]
     j_arr     = edges_arr[:, 1]
-
     # precompute COO structure for L_k — same every step, only data changes
     row_idx = np.concatenate([i_arr, j_arr, i_arr, j_arr])
     col_idx = np.concatenate([i_arr, j_arr, j_arr, i_arr])
-
     # precompute boundary/interior split once
     boundary   = set(gamma_in) | set(gamma_out)
-    interior   = np.array([v for v in range(n_vertices) 
+    interior   = np.array([v for v in range(n_vertices)
                            if v not in boundary])
     p_boundary = np.zeros(n_vertices)
     for v in gamma_in:
         p_boundary[v] = 1.0
-
+    for v in gamma_out:
+        p_boundary[v] = 0.0
     gamma_out_set = set(gamma_out)
 
     with tqdm(total=N, desc="Monte Carlo", unit="sample") as pbar:
@@ -540,10 +618,8 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
             w = np.random.randn(len(edges))
             f = B @ w
             u = cho_solve(cho_cache, np.sqrt(lambda_min) * f)
-
             # Phase 4 — vectorized
             k_vals = np.exp((u[i_arr] + u[j_arr]) / 2)
-
             # Phase 5a — build L_k using precomputed structure
             diag_data = np.concatenate([k_vals, k_vals])
             offdiag_data = np.concatenate([-k_vals, -k_vals])
@@ -554,23 +630,87 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
             # Phase 5b — solve
             L_interior = L_k[interior, :][:, interior]
             rhs        = -L_k[interior, :][:, list(boundary)] @ p_boundary[list(boundary)]
-            p          = np.zeros(n_vertices)
-            p[interior] = spsolve(L_interior, rhs)
+
+            p_interior = spsolve(L_interior, rhs)
+
+            if debug:
+                if np.any(np.isnan(p_interior)) or np.any(np.isinf(p_interior)):
+                    raise ValueError(
+                        f"Sample {idx}: solve produced NaN/Inf in interior pressures — "
+                        f"check L_interior for singularity (possible disconnected interior region)."
+                    )
+
+            p = np.zeros(n_vertices)
+            p[interior] = p_interior
             for v in gamma_in:
                 p[v] = 1.0
+            for v in gamma_out:
+                p[v] = 0.0
+
+            if debug:
+                tol = 1e-8
+                if p[interior].min() < -tol or p[interior].max() > 1 + tol:
+                    raise ValueError(
+                        f"Sample {idx}: pressure out of physical bounds "
+                        f"[min={p[interior].min():.6f}, max={p[interior].max():.6f}] — "
+                        f"expected range [0, 1]."
+                    )
 
             # Phase 6 — vectorized
             p_diff = np.abs(p[i_arr] - p[j_arr])
-            outlet_mask = np.array([i in gamma_out_set or j in gamma_out_set 
+            outlet_mask = np.array([i in gamma_out_set or j in gamma_out_set
                                     for i,j in edges])
             Q_samples[idx] = np.sum(k_vals[outlet_mask] * p_diff[outlet_mask])
-
             pbar.update(1)
             pbar.set_postfix({"mean Q": f"{Q_samples[:idx+1].mean():.4f}"})
 
     print(f"\n✓ Done — {N} samples")
     print(f"  Mean Q : {Q_samples.mean():.6f}")
     print(f"  Std Q  : {Q_samples.std():.6f}")
+    return Q_samples
+
+
+# function to use to run MC loop and track its progress if tqdm widget fails to render
+def monte_carlo_loop_tracked(L_sigma, lambda_min, edges, n_vertices, 
+                               gamma_in, gamma_out, edge_weights, 
+                               N, use_amg=False, print_every=50):
+    """
+    Same as monte_carlo_loop_tqdm, but with explicit progress printing
+    and per-sample timing so you can judge whether AMG is worth switching to.
+    """
+    Q_samples = []
+    start_time = time.time()
+    sample_times = []
+
+    for n in tqdm(range(N), desc="Monte Carlo", ncols=80):
+        sample_start = time.time()
+
+        u = run_phase3(L_sigma, lambda_min, edges, n_vertices)
+        k = compute_permeability(u, edges, edge_weights)
+        L_k = build_weighted_laplacian(edges, n_vertices, k)
+
+        if use_amg:
+            p = solve_darcy_amg(L_k, n_vertices, gamma_in, gamma_out)
+        else:
+            p = solve_darcy(L_k, n_vertices, gamma_in, gamma_out)
+
+        Q = extract_qoi(p, k, edges, gamma_out)
+        Q_samples.append(Q)
+
+        sample_times.append(time.time() - sample_start)
+
+        if (n + 1) % print_every == 0:
+            elapsed = time.time() - start_time
+            avg_per_sample = sum(sample_times) / len(sample_times)
+            remaining = (N - (n + 1)) * avg_per_sample
+            print(f"[{n+1}/{N}] elapsed: {elapsed:.1f}s | "
+                  f"avg/sample: {avg_per_sample:.3f}s | "
+                  f"est. remaining: {remaining:.1f}s")
+
+    total_time = time.time() - start_time
+    print(f"\n✓ Done: {N} samples in {total_time:.1f}s "
+          f"({total_time/N:.3f}s/sample avg)")
+
     return Q_samples
 
 
