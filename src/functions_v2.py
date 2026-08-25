@@ -27,6 +27,7 @@ import pyamg
 from scipy.sparse import lil_matrix, diags
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import spsolve
+from sksparse.cholmod import cholesky as sparse_cholesky
 
 # =============================================================================
 # DATA LOADING
@@ -128,6 +129,103 @@ def load_graph(filepath):
     print(f"  Weighted : {'yes' if edge_weights else 'no'}")
     print()
     return edges, n_vertices, edge_weights
+
+# check for connectivity and find number of components
+
+def check_connectivity(edges, n_vertices):
+    """
+    Report the number of connected components in a graph. Use this
+    right after load_graph() to decide whether filter_to_largest_component()
+    needs to be called before proceeding to Phase 1 -- a disconnected
+    graph produces a Laplacian with multiple zero eigenvalues, which
+    breaks compute_lambda_min's k=2 eigenvalue request and can cause
+    downstream Darcy solves to silently return NaN.
+
+    Parameters
+    ----------
+    edges      : list of (i, j) tuples
+    n_vertices : int
+
+    Returns
+    -------
+    num_components : int
+    """
+    import networkx as nx
+
+    G_nx = nx.Graph()
+    G_nx.add_edges_from(edges)
+    num_components = nx.number_connected_components(G_nx)
+
+    print(f"Components: {num_components}")
+    if num_components > 1:
+        component_sizes = sorted((len(c) for c in nx.connected_components(G_nx)), reverse=True)
+        print(f"  Component sizes: {component_sizes}")
+        print(f"  -> Call filter_to_largest_component() before proceeding to Phase 1")
+    else:
+        print(f"  -> Graph is fully connected, safe to proceed")
+    print()
+
+    return num_components
+
+# filter out the disconnected components
+def filter_to_largest_component(edges, n_vertices):
+    """
+    Filter a graph down to its largest connected component, remapping
+    node IDs to a contiguous 0-indexed range. Always run this after
+    load_graph() and before Phase 1, since a disconnected graph produces
+    a Laplacian with multiple zero eigenvalues -- this breaks
+    compute_lambda_min's k=2 eigenvalue request (which expects exactly
+    one zero eigenvalue plus lambda_min), and downstream Darcy solves
+    can silently return NaN if gamma_in/gamma_out/interior end up split
+    across disconnected pieces.
+
+    If the graph is already fully connected, this is a no-op.
+
+    Parameters
+    ----------
+    edges        : list of (i, j) tuples
+    n_vertices   : int
+    edge_weights : dict of {(i,j): weight} or None
+
+    Returns
+    -------
+    edges        : list of (i, j) tuples, filtered and remapped
+    n_vertices   : int -- vertex count of the largest component only
+    edge_weights : dict or None, remapped to match
+    """
+
+
+    G_nx = nx.Graph()
+    G_nx.add_edges_from(edges)
+    num_components = nx.number_connected_components(G_nx)
+
+    print(f"Components: {num_components}")
+
+    if num_components == 1:
+        print("✓ Graph is already fully connected — no filtering needed")
+        print()
+        return edges, n_vertices, edge_weights
+
+    component_sizes = sorted((len(c) for c in nx.connected_components(G_nx)), reverse=True)
+    print(f"  Component sizes: {component_sizes}")
+
+    largest_cc = max(nx.connected_components(G_nx), key=len)
+    G_sub = G_nx.subgraph(largest_cc).copy()
+
+    all_nodes = sorted(largest_cc)
+    node_map = {old: new for new, old in enumerate(all_nodes)}
+    filtered_edges = [(node_map[i], node_map[j]) for i, j in G_sub.edges()]
+    filtered_n_vertices = len(all_nodes)
+
+    filtered_edge_weights = None
+
+    print(f"✓ Filtered to largest component")
+    print(f"  Vertices : {n_vertices} -> {filtered_n_vertices} "
+          f"(dropped {n_vertices - filtered_n_vertices})")
+    print(f"  Edges    : {len(edges)} -> {len(filtered_edges)}")
+    print()
+
+    return filtered_edges, filtered_n_vertices
 
 
 # =============================================================================
@@ -247,23 +345,85 @@ def compute_lambda_min(L, D):
 
 def build_shifted_laplacian(L, D, lambda_min, sigma_squared=0.25):
     """
-    Build shifted Laplacian L_sigma = L + sigma^2 * sqrt(lambda_min) * D.
-    Works with both dense and sparse L and D.
-    Returns a dense matrix since Cholesky requires dense input.
+    Build shifted Laplacian L_sigma = L + sigma^2 * lambda_min * D.
+    Works with both dense and sparse L and D. Returns sparse (CSC) when
+    given sparse input, for use with sparse Cholesky (scikit-sparse/
+    CHOLMOD) in Phase 3 -- do not convert to dense, since that defeats
+    the ~500x speedup validated on Oregon Router.
     """
     from scipy.sparse import issparse
-
     if issparse(L):
-        L_sigma = L + sigma_squared * lambda_min * D
-        L_sigma = L_sigma.toarray()  # convert to dense for Cholesky
+        L_sigma = (L + sigma_squared * lambda_min * D).tocsc()
     else:
         L_sigma = L + sigma_squared * lambda_min * D
-
     print(f"✓ Phase 2 complete: L_sigma built (sigma^2 = {sigma_squared})")
+    print(f"  L_sigma type: {'sparse' if issparse(L_sigma) else 'dense'}")
     print()
     return L_sigma
 
 
+def find_diameter_endpoints(G_nx, n_sample=5, k_hop=4):
+    """
+    Approximate the graph's diameter endpoints using the double-BFS
+    heuristic, then expand each endpoint into a k-hop neighborhood to
+    use as gamma_in / gamma_out.
+
+    Double-BFS mechanism: from an arbitrary starting vertex, BFS finds
+    the farthest reachable vertex (call it v). A second BFS, starting
+    from v, finds the farthest vertex from v (call it w). The distance
+    between v and w closely approximates the graph's true diameter,
+    without needing to check all-pairs shortest paths. Repeating this
+    from several different starting vertices and keeping the best
+    result found hedges against an unlucky first choice of start.
+
+    NOTE: k_hop should be chosen relative to the graph's diameter, not
+    as a fixed constant across datasets -- a k_hop that works well on
+    a large-diameter graph can claim almost the entire graph on a
+    small-diameter, hub-dominated one. Always check boundary fraction
+    (see check_boundary_fraction) after calling this.
+
+    Parameters
+    ----------
+    G_nx     : networkx.Graph
+    n_sample : int -- number of different starting vertices to try
+    k_hop    : int -- neighborhood radius around each endpoint
+
+    Returns
+    -------
+    gamma_in   : list of int -- k-hop neighborhood around one endpoint
+    gamma_out  : list of int -- k-hop neighborhood around the other endpoint
+    diameter   : int -- the approximated diameter (distance between endpoints)
+    """
+
+    best_distance = 0
+    best_endpoint_1, best_endpoint_2 = None, None
+
+    start_vertices = list(G_nx.nodes())[:n_sample]
+
+    for start in start_vertices:
+        # First BFS: find the vertex farthest from `start`
+        distances_from_start = nx.single_source_shortest_path_length(G_nx, start)
+        farthest_from_start = max(distances_from_start, key=distances_from_start.get)
+
+        # Second BFS: find the vertex farthest from that result
+        distances_from_far_point = nx.single_source_shortest_path_length(G_nx, farthest_from_start)
+        opposite_endpoint = max(distances_from_far_point, key=distances_from_far_point.get)
+        candidate_distance = distances_from_far_point[opposite_endpoint]
+
+        # Keep the best (longest) pair found across all starting attempts
+        if candidate_distance > best_distance:
+            best_distance = candidate_distance
+            best_endpoint_1, best_endpoint_2 = farthest_from_start, opposite_endpoint
+
+    # Expand each endpoint into a k-hop neighborhood
+    gamma_in = set(nx.single_source_shortest_path_length(G_nx, best_endpoint_1, cutoff=k_hop).keys())
+    gamma_out = set(nx.single_source_shortest_path_length(G_nx, best_endpoint_2, cutoff=k_hop).keys())
+
+    # Remove any overlap (rare, but possible if k_hop is large relative to the diameter)
+    gamma_in = gamma_in - gamma_out
+    gamma_out = gamma_out - gamma_in
+
+    return list(map(int, gamma_in)), list(map(int, gamma_out)), best_distance
 # =============================================================================
 # PHASE 3: White Noise Sampling Pipeline
 # =============================================================================
