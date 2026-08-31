@@ -37,24 +37,15 @@ def load_graph(filepath):
     """
     Load a graph from either a Matrix Market (.mtx) file or a plain edge list.
     Automatically detects format, delimiter (whitespace or comma), and whether
-    edges are weighted.
-
-    Parameters
-    ----------
-    filepath : str — path to the graph file
-
-    Returns
-    -------
-    edges        : list of (i, j) tuples — 0-indexed
-    n_vertices   : int — total number of vertices
-    edge_weights : dict of {(i,j): weight} or None if unweighted
+    edges are weighted. Automatically remaps non-contiguous or non-zero-starting
+    node IDs to a contiguous 0-indexed range, since n_vertices is always based
+    on the actual count of distinct nodes referenced — not the maximum ID seen.
     """
     with open(filepath, 'r') as f:
         first_line = f.readline().strip()
 
     if first_line.startswith('%%MatrixMarket'):
         sparse_matrix = mmread(filepath).tocsr()
-        n_vertices = sparse_matrix.shape[0]
         coo = sparse_matrix.tocoo()
         edges = []
         edge_weights = {}
@@ -68,67 +59,57 @@ def load_graph(filepath):
     else:
         edges = []
         edge_weights = {}
-        max_vertex = 0
         weighted = None
-        delimiter = None  # auto-detected on first data line: ',' or None (whitespace)
-        zero_indexed = None  # auto-detected from a '%% n_nodes n_edges' style header
+        delimiter = None
+        zero_indexed = None
 
         with open(filepath, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-
-                # Header/comment lines: '%', '#', or '%%' (but not '%%MatrixMarket',
-                # already handled above). A '%% <n_vertices> <n_edges>' style header
-                # (seen in files like bio-grid-human.edges) gives us vertex count directly.
                 if line.startswith('%') or line.startswith('#'):
-                    header_parts = line.lstrip('%#').split()
-                    if len(header_parts) == 2 and all(p.isdigit() for p in header_parts):
-                        # e.g. '%% 9527 62364' -> n_vertices, n_edges hint
-                        max_vertex = max(max_vertex, int(header_parts[0]) - 1)
                     continue
-
-                # Detect delimiter once, from the first real data line
                 if delimiter is None:
                     delimiter = ',' if (',' in line and len(line.split()) == 1) else None
-
                 parts = line.split(delimiter) if delimiter else line.split()
                 parts = [p.strip() for p in parts if p.strip() != '']
-
                 if weighted is None:
                     weighted = len(parts) == 3
-
                 i_raw, j_raw = int(parts[0]), int(parts[1])
-
-                # Detect 0- vs 1-indexing once: if we ever see a literal 0, the file
-                # is already 0-indexed and must NOT be shifted down by 1.
                 if zero_indexed is None:
                     zero_indexed = (i_raw == 0 or j_raw == 0)
-
                 if zero_indexed:
                     i, j = i_raw, j_raw
                 else:
                     i, j = i_raw - 1, j_raw - 1
-
                 if i == j:
                     continue
                 i, j = min(i, j), max(i, j)
                 edges.append((i, j))
                 if weighted:
                     edge_weights[(i, j)] = float(parts[2])
-                max_vertex = max(max_vertex, i, j)
 
         edges = list(set(edges))
-        n_vertices = max_vertex + 1
         edge_weights = edge_weights if weighted else None
+
+    # --- THIS IS THE REMAPPING BLOCK — check if your version has this ---
+    all_nodes = sorted(set(v for e in edges for v in e))
+    n_vertices = len(all_nodes)
+    node_map = {old: new for new, old in enumerate(all_nodes)}
+
+    edges = [(node_map[i], node_map[j]) for (i, j) in edges]
+    if edge_weights is not None:
+        edge_weights = {(node_map[i], node_map[j]): w for (i, j), w in edge_weights.items()}
 
     print(f"✓ Loaded: {filepath}")
     print(f"  Vertices : {n_vertices}")
     print(f"  Edges    : {len(edges)}")
     print(f"  Weighted : {'yes' if edge_weights else 'no'}")
     print()
+
     return edges, n_vertices, edge_weights
+
 
 # check for connectivity and find number of components
 

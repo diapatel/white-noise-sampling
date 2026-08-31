@@ -25,6 +25,8 @@ import networkx as nx
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import spsolve
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from tqdm import tqdm
 
 # ============================================================
 # Precondition check -- run this BEFORE attempting aggregation
@@ -525,7 +527,6 @@ def _solve_coarse(setup: TwoLevelSetup, k_vals):
 # ============================================================
 # Validation / estimator
 # ============================================================
-
 def run_paired_validation(setup: TwoLevelSetup, N=300, seed_offset=0, verbose=True):
     """
     Run N paired samples and report the two numbers that determine
@@ -539,17 +540,24 @@ def run_paired_validation(setup: TwoLevelSetup, N=300, seed_offset=0, verbose=Tr
     """
     Q_fine_samples = np.zeros(N)
     Q_coarse_samples = np.zeros(N)
-    for n in range(N):
-        qf, qc = run_one_paired_sample(setup, seed=seed_offset + n)
-        Q_fine_samples[n] = qf
-        Q_coarse_samples[n] = qc
+
+    with tqdm(total=N, desc="Paired samples", unit="sample") as pbar:
+        for n in range(N):
+            qf, qc = run_one_paired_sample(setup, seed=seed_offset + n)
+            Q_fine_samples[n] = qf
+            Q_coarse_samples[n] = qc
+            pbar.update(1)
+            pbar.set_postfix({
+                "Q_fine": f"{Q_fine_samples[:n+1].mean():.4f}",
+                "Q_coarse": f"{Q_coarse_samples[:n+1].mean():.4f}",
+            })
 
     diff_samples = Q_fine_samples - Q_coarse_samples
     correlation = np.corrcoef(Q_fine_samples, Q_coarse_samples)[0, 1]
     variance_reduction = Q_fine_samples.var() / diff_samples.var()
 
     if verbose:
-        print(f"N = {N} paired samples")
+        print(f"\nN = {N} paired samples")
         print(f"Q_fine   : mean={Q_fine_samples.mean():.6f}  var={Q_fine_samples.var():.6f}")
         print(f"Q_coarse : mean={Q_coarse_samples.mean():.6f}  var={Q_coarse_samples.var():.6f}")
         print(f"Q_fine - Q_coarse : mean={diff_samples.mean():.6f}  var={diff_samples.var():.6f}")
@@ -564,7 +572,6 @@ def run_paired_validation(setup: TwoLevelSetup, N=300, seed_offset=0, verbose=Tr
         'variance_reduction': variance_reduction,
     }
 
-
 def two_level_estimate(setup: TwoLevelSetup, paired_result, N_coarse_only=2000,
                         seed_offset=100000, verbose=True):
     """
@@ -572,27 +579,24 @@ def two_level_estimate(setup: TwoLevelSetup, paired_result, N_coarse_only=2000,
     paired correction term to produce the full two-level estimate of
     E[Q_fine].
 
-    Parameters
-    ----------
-    setup          : TwoLevelSetup
-    paired_result  : dict, output of run_paired_validation()
-    N_coarse_only  : how many additional coarse-only samples to draw
-    seed_offset    : keep disjoint from the paired samples' seeds
-
     Returns
     -------
     dict with keys: estimate, coarse_base_mean, correction_mean
     """
-    Q_coarse_only = np.array([
-        run_coarse_only_sample(setup, seed=seed_offset + n)
-        for n in range(N_coarse_only)
-    ])
+    Q_coarse_only = np.zeros(N_coarse_only)
+
+    with tqdm(total=N_coarse_only, desc="Coarse-only samples", unit="sample") as pbar:
+        for n in range(N_coarse_only):
+            Q_coarse_only[n] = run_coarse_only_sample(setup, seed=seed_offset + n)
+            pbar.update(1)
+            pbar.set_postfix({"Q_coarse": f"{Q_coarse_only[:n+1].mean():.4f}"})
+
     coarse_base_mean = Q_coarse_only.mean()
     correction_mean = paired_result['diff_samples'].mean()
     estimate = coarse_base_mean + correction_mean
 
     if verbose:
-        print(f"Coarse-only base estimate (N={N_coarse_only}): {coarse_base_mean:.6f}")
+        print(f"\nCoarse-only base estimate (N={N_coarse_only}): {coarse_base_mean:.6f}")
         print(f"Correction term mean (paired samples): {correction_mean:.6f}")
         print(f"Two-level estimate of E[Q_fine]: {estimate:.6f}")
         print(f"Direct fine-only mean (for comparison): "
@@ -698,3 +702,172 @@ def plot_convergence(result, title="Convergence Analysis"):
     fig.suptitle(title, fontsize=13)
     plt.tight_layout()
     plt.show()
+
+
+
+"""
+visualize_fine_coarse
+ 
+General-purpose fine-vs-coarse graph visualization, usable across any
+dataset in the two-level MC project regardless of scale (validated on
+graphs from 15 to 1000+ vertices). Automatically adapts node sizing,
+edge width, and layout parameters based on graph size, since a single
+fixed sizing scheme looks wrong across very different vertex counts
+(this was discovered directly while building Facebook/Oregon figures
+for the paper -- see project notes).
+ 
+Usage
+-----
+from visualize_fine_coarse import visualize_fine_and_coarse
+ 
+fig, axes = visualize_fine_and_coarse(
+    G_nx, aggregate_of, n_coarse, coarse_edges,
+    gamma_in_coarse, gamma_out_coarse,
+    dataset_name="Power Grid",
+    save_path="power_grid_fine_coarse.png"
+)
+"""
+ 
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+ 
+ 
+def visualize_fine_and_coarse(
+    G_nx,
+    aggregate_of,
+    n_coarse,
+    coarse_edges,
+    gamma_in_coarse,
+    gamma_out_coarse,
+    dataset_name="Dataset",
+    save_path=None,
+    figsize=(18, 8),
+):
+    """
+    Plot the fine graph and its coarse graph side by side, colored by
+    boundary role (gamma_in / gamma_out / interior).
+ 
+    Parameters
+    ----------
+    G_nx              : networkx.Graph -- the fine graph
+    aggregate_of      : dict {fine_vertex: coarse_vertex_id}
+    n_coarse          : int
+    coarse_edges      : list of (agg_i, agg_j) tuples
+    gamma_in_coarse   : list of int -- coarse vertex ids that are gamma_in
+    gamma_out_coarse  : list of int -- coarse vertex ids that are gamma_out
+    dataset_name      : str -- used in plot titles
+    save_path         : str or None -- if given, saves the figure here
+    figsize           : tuple -- overall figure size
+ 
+    Returns
+    -------
+    fig, axes : the matplotlib figure and axes, for further tweaking
+    """
+    n_vertices = G_nx.number_of_nodes()
+    n_edges = G_nx.number_of_edges()
+ 
+    # ---- Adaptive sizing thresholds, tuned across 15- to 1000+-vertex tests ----
+    if n_vertices <= 50:
+        node_size_fine, edge_width_fine, edge_alpha_fine = 500, 1.5, 0.8
+        layout_iters, show_labels = 50, True
+    elif n_vertices <= 2000:
+        node_size_fine, edge_width_fine, edge_alpha_fine = 40, 0.4, 0.4
+        layout_iters, show_labels = 25, False
+    else:
+        node_size_fine, edge_width_fine, edge_alpha_fine = 3, 0.08, 0.2
+        layout_iters, show_labels = 12, False
+ 
+    groups = {}
+    for v, a in aggregate_of.items():
+        groups.setdefault(a, []).append(v)
+    agg_sizes = {a: len(m) for a, m in groups.items()}
+ 
+    gamma_in_set = set(gamma_in_coarse)
+    gamma_out_set = set(gamma_out_coarse)
+ 
+    node_colors_fine = []
+    for v in G_nx.nodes():
+        a = aggregate_of[v]
+        if a in gamma_in_set:
+            node_colors_fine.append('#ff9e9e')
+        elif a in gamma_out_set:
+            node_colors_fine.append('#9ecbff')
+        else:
+            node_colors_fine.append('#b0b0b0')
+ 
+    fig, axes = plt.subplots(1, 2, figsize=figsize, facecolor='white')
+ 
+    # ---- Fine graph ----
+    ax = axes[0]
+    pos_fine = nx.spring_layout(G_nx, seed=7, k=None, iterations=layout_iters)
+    nx.draw_networkx_edges(G_nx, pos_fine, ax=ax, width=edge_width_fine,
+                            edge_color='#999999', alpha=edge_alpha_fine)
+    nx.draw_networkx_nodes(
+        G_nx, pos_fine, ax=ax, node_size=node_size_fine,
+        node_color=node_colors_fine,
+        edgecolors='none' if n_vertices > 50 else '#1a1a1a',
+        linewidths=0 if n_vertices > 50 else 1.2,
+    )
+    if show_labels:
+        nx.draw_networkx_labels(G_nx, pos_fine, ax=ax, font_size=9, font_weight='bold')
+    ax.set_title(f"{dataset_name} — Fine graph\n{n_vertices} vertices, {n_edges} edges", fontsize=12)
+    ax.axis('off')
+ 
+    # ---- Coarse graph ----
+    ax = axes[1]
+    G_coarse = nx.Graph()
+    G_coarse.add_nodes_from(range(n_coarse))
+    G_coarse.add_edges_from(coarse_edges)
+ 
+    if n_coarse <= 50:
+        node_size_coarse = [200 + agg_sizes.get(a, 1) * 120 for a in G_coarse.nodes()]
+        edge_width_coarse, show_labels_coarse = 1.5, True
+    elif n_coarse <= 2000:
+        node_size_coarse = [10 + agg_sizes.get(a, 1) * 4 for a in G_coarse.nodes()]
+        edge_width_coarse, show_labels_coarse = 0.4, False
+    else:
+        node_size_coarse = [2 + agg_sizes.get(a, 1) * 0.8 for a in G_coarse.nodes()]
+        edge_width_coarse, show_labels_coarse = 0.08, False
+ 
+    node_colors_coarse = []
+    for a in G_coarse.nodes():
+        if a in gamma_in_set:
+            node_colors_coarse.append('#ff9e9e')
+        elif a in gamma_out_set:
+            node_colors_coarse.append('#9ecbff')
+        else:
+            node_colors_coarse.append('#7fb37f')
+ 
+    pos_coarse = nx.spring_layout(G_coarse, seed=7, k=None, iterations=layout_iters)
+    nx.draw_networkx_edges(G_coarse, pos_coarse, ax=ax, width=edge_width_coarse,
+                            edge_color='#666666', alpha=0.5)
+    nx.draw_networkx_nodes(
+        G_coarse, pos_coarse, ax=ax, node_size=node_size_coarse,
+        node_color=node_colors_coarse,
+        edgecolors='none' if n_coarse > 50 else '#1a1a1a',
+        linewidths=0 if n_coarse > 50 else 1.2,
+    )
+    if show_labels_coarse:
+        labels = {a: f"{a}\n({agg_sizes.get(a, 1)})" for a in G_coarse.nodes()}
+        nx.draw_networkx_labels(G_coarse, pos_coarse, labels=labels, ax=ax, font_size=8, font_weight='bold')
+    ax.set_title(
+        f"{dataset_name} — Coarse graph\n{n_coarse} vertices, {len(coarse_edges)} edges "
+        f"({n_vertices / n_coarse:.1f}x reduction)",
+        fontsize=12,
+    )
+    ax.axis('off')
+ 
+    legend_patches = [
+        mpatches.Patch(color='#ff9e9e', label='gamma_in'),
+        mpatches.Patch(color='#9ecbff', label='gamma_out'),
+        mpatches.Patch(color='#b0b0b0', label='interior (fine)'),
+    ]
+    fig.legend(handles=legend_patches, loc='lower center', ncol=3, fontsize=10, bbox_to_anchor=(0.5, -0.02))
+ 
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=140, bbox_inches='tight', facecolor='white')
+        print(f"saved to {save_path}")
+ 
+    return fig, axes
