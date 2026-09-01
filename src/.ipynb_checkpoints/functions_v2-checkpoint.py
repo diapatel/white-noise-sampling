@@ -458,7 +458,6 @@ def run_phase3(L_sigma, lambda_min, edges, n_vertices):
     B      : scipy.sparse.csr_matrix — incidence matrix (reuse in MC loop)
     factor : sksparse.cholmod.Factor — cached factorization (reuse via .solve_A())
     """
-    from sksparse.cholmod import cholesky as sparse_cholesky
 
     B = build_incidence_matrix(edges, n_vertices)
     factor = sparse_cholesky(L_sigma)
@@ -477,28 +476,28 @@ def run_phase3(L_sigma, lambda_min, edges, n_vertices):
 # PHASE 4: Build Random Edge Permeability
 # =============================================================================
 
-def compute_permeability(u, edges, edge_weights=None):
+def compute_permeability(u, edges):
     """
     Convert vertex field u into edge permeabilities k.
-    Vectorized for speed — avoids Python loop over edges.
+    Vectorized — returns a plain array in the same order as `edges`,
+    matching the order expected by build_weighted_laplacian and extract_qoi.
+
+    Parameters
+    ----------
+    u     : np.ndarray (n_vertices,) — spatially correlated field from Phase 3
+    edges : list of (i, j) tuples
+
+    Returns
+    -------
+    k_vals : np.ndarray (n_edges,) — edge permeabilities, k_e > 0
     """
     edges_arr = np.array(edges)
-    i_arr     = edges_arr[:, 0]
-    j_arr     = edges_arr[:, 1]
-    
-    base = np.exp((u[i_arr] + u[j_arr]) / 2)
-    
-    if edge_weights:
-        w_arr = np.array([edge_weights.get((i,j), 
-                          edge_weights.get((j,i), 1.0)) 
-                          for i,j in edges])
-        values = base * w_arr
-    else:
-        values = base
+    i_arr = edges_arr[:, 0]
+    j_arr = edges_arr[:, 1]
 
-    k = {(int(i), int(j)): float(v) 
-         for i, j, v in zip(i_arr, j_arr, values)}
-    return k
+    k_vals = np.exp((u[i_arr] + u[j_arr]) / 2)
+
+    return k_vals
 
 
 # =============================================================================
@@ -522,7 +521,8 @@ def build_weighted_laplacian(edges, n_vertices, k):
     ----------
     edges      : list of (i, j) tuples
     n_vertices : int
-    k          : dict of {(i,j): k_e} — edge permeabilities from Phase 4
+    k          : np.ndarray (n_edges,) — edge permeabilities from Phase 4,
+                 in the SAME ORDER as `edges` (see compute_permeability)
 
     Returns
     -------
@@ -532,8 +532,13 @@ def build_weighted_laplacian(edges, n_vertices, k):
     i_arr = edges_arr[:, 0]
     j_arr = edges_arr[:, 1]
 
-    k_vals = np.array([k.get((i, j), k.get((j, i), 0.0)) for i, j in edges])
+    k_vals = np.asarray(k)
 
+    if len(k_vals) != len(edges):
+        raise ValueError(
+            f"k has {len(k_vals)} values but edges has {len(edges)} — "
+            f"k must be in the same order as edges (see compute_permeability)."
+        )
     if np.any(k_vals <= 0):
         raise ValueError(
             f"Found {np.sum(k_vals <= 0)} non-positive permeability value(s) — "
@@ -545,11 +550,9 @@ def build_weighted_laplacian(edges, n_vertices, k):
     diag_data = np.concatenate([k_vals, k_vals])
     offdiag_data = np.concatenate([-k_vals, -k_vals])
     data = np.concatenate([diag_data, offdiag_data])
-
     L_k = coo_matrix((data, (row_idx, col_idx)),
                       shape=(n_vertices, n_vertices)).tocsr()
 
-    # Sanity checks — cheap relative to the solve, catch structural bugs early
     row_sums = np.array(L_k.sum(axis=1)).flatten()
     if not np.allclose(row_sums, 0, atol=1e-8):
         raise ValueError(
