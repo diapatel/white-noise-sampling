@@ -408,16 +408,16 @@ def find_diameter_endpoints(G_nx, n_sample=5, k_hop=4):
 # =============================================================================
 # PHASE 3: White Noise Sampling Pipeline
 # =============================================================================
-
 def build_incidence_matrix(edges, n_vertices):
     """
-    Build the signed vertex-edge incidence matrix B (n x m) as a sparse CSR matrix.
-    B[i, e] = +1 if vertex i is the first endpoint of edge e
-    B[j, e] = -1 if vertex j is the second endpoint of edge e
+    Build the UNSIGNED vertex-edge incidence matrix B (n x e) as a sparse CSR matrix.
+    B[i, e] = +1 if vertex i is EITHER endpoint of edge e
+    Both endpoints of every edge get +1 -- this avoids implying any
+    physical direction on the (undirected) graph's edges.
 
-    Using sparse format avoids memory issues for large graphs —
-    a dense (11174 x 23409) matrix requires ~2GB RAM whereas
-    the sparse version requires only a few MB.
+    Using sparse format avoids memory issues for large graphs — a
+    dense (11174 x 23409) matrix requires ~2.09 GB RAM whereas the
+    sparse version requires only a few MB.
 
     Parameters
     ----------
@@ -429,52 +429,48 @@ def build_incidence_matrix(edges, n_vertices):
     B : scipy.sparse.csr_matrix (n_vertices x n_edges)
     """
     from scipy.sparse import lil_matrix
-    
+
     n_edges = len(edges)
     B = lil_matrix((n_vertices, n_edges))
-    
+
     for idx, (i, j) in enumerate(edges):
-        B[i, idx] =  1
-        B[j, idx] = -1
-    
+        B[i, idx] = 1
+        B[j, idx] = 1   # both endpoints get +1, not -1
+
     return B.tocsr()
 
 
 def run_phase3(L_sigma, lambda_min, edges, n_vertices):
     """
-    Run the full Phase 3 white noise sampling pipeline.
+    Run the full Phase 3 white noise sampling pipeline, using sparse
+    Cholesky (scikit-sparse/CHOLMOD).
 
     Steps:
         3a. Draw edge noise:       w_e ~ N(0,1) for every edge
         3b. Map noise to vertices: f = B @ w
-        3c. Solve for u:           L_sigma @ u = lambda_min * f
+        3c. Solve for u:           L_sigma @ u = sqrt(lambda_min) * f
 
-    L_sigma is Cholesky factorized once for reuse in the MC loop.
-
-    Parameters
-    ----------
-    L_sigma    : np.ndarray — shifted Laplacian from Phase 2
-    lambda_min : float — from Phase 2
-    edges      : list of (i, j) tuples
-    n_vertices : int
+    L_sigma must be sparse (CSC). Factorized once for reuse in the MC loop.
 
     Returns
     -------
-    u         : np.ndarray (n_vertices,) — spatially correlated field
-    B         : np.ndarray — incidence matrix (reuse in MC loop)
-    cho_cache : Cholesky factorization (reuse in MC loop)
+    u      : np.ndarray (n_vertices,) — spatially correlated field
+    B      : scipy.sparse.csr_matrix — incidence matrix (reuse in MC loop)
+    factor : sksparse.cholmod.Factor — cached factorization (reuse via .solve_A())
     """
-    B         = build_incidence_matrix(edges, n_vertices)
-    cho_cache = cho_factor(L_sigma)
+    from sksparse.cholmod import cholesky as sparse_cholesky
+
+    B = build_incidence_matrix(edges, n_vertices)
+    factor = sparse_cholesky(L_sigma)
 
     w = np.random.randn(len(edges))
     f = B @ w
-    u = cho_solve(cho_cache, np.sqrt(lambda_min) * f)
+    u = factor.solve_A(np.sqrt(lambda_min) * f)
 
     print("✓ Phase 3 complete: correlated field u generated")
     print(f"  u range: [{u.min():.4f}, {u.max():.4f}]")
     print()
-    return u, B, cho_cache
+    return u, B, factor
 
 
 # =============================================================================
@@ -810,49 +806,6 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
     print(f"  Std Q  : {Q_samples.std():.6f}")
     return Q_samples
 
-
-# function to use to run MC loop and track its progress if tqdm widget fails to render
-def monte_carlo_loop_tracked(L_sigma, lambda_min, edges, n_vertices, 
-                               gamma_in, gamma_out, edge_weights, 
-                               N, use_amg=False, print_every=50):
-    """
-    Same as monte_carlo_loop_tqdm, but with explicit progress printing
-    and per-sample timing so you can judge whether AMG is worth switching to.
-    """
-    Q_samples = []
-    start_time = time.time()
-    sample_times = []
-
-    for n in tqdm(range(N), desc="Monte Carlo", ncols=80):
-        sample_start = time.time()
-
-        u = run_phase3(L_sigma, lambda_min, edges, n_vertices)
-        k = compute_permeability(u, edges, edge_weights)
-        L_k = build_weighted_laplacian(edges, n_vertices, k)
-
-        if use_amg:
-            p = solve_darcy_amg(L_k, n_vertices, gamma_in, gamma_out)
-        else:
-            p = solve_darcy(L_k, n_vertices, gamma_in, gamma_out)
-
-        Q = extract_qoi(p, k, edges, gamma_out)
-        Q_samples.append(Q)
-
-        sample_times.append(time.time() - sample_start)
-
-        if (n + 1) % print_every == 0:
-            elapsed = time.time() - start_time
-            avg_per_sample = sum(sample_times) / len(sample_times)
-            remaining = (N - (n + 1)) * avg_per_sample
-            print(f"[{n+1}/{N}] elapsed: {elapsed:.1f}s | "
-                  f"avg/sample: {avg_per_sample:.3f}s | "
-                  f"est. remaining: {remaining:.1f}s")
-
-    total_time = time.time() - start_time
-    print(f"\n✓ Done: {N} samples in {total_time:.1f}s "
-          f"({total_time/N:.3f}s/sample avg)")
-
-    return Q_samples
 
 
 def analyze_qoi(Q_samples, save_as=None):
