@@ -221,6 +221,93 @@ def build_capped_aggregation(G_nx, gamma_in, gamma_out, max_size=10):
     aggregate_of = {v: relabel[a] for v, a in aggregate_of.items()}
     return aggregate_of, len(unique_ids)
 
+def build_grouped_aggregation(G_nx, gamma_in, gamma_out, max_size=10):
+    """
+    Aggregate gamma_in with gamma_in, gamma_out with gamma_out, and
+    interior with interior -- no cross-group merging at all.
+
+    Within each group, independently:
+    1. Sort nodes by increasing degree.
+    2. For each node, in order:
+       a. If it has an unassigned neighbor WITHIN THE SAME GROUP,
+          pair them together as a new aggregate.
+       b. Otherwise, if it has a neighbor (within the same group)
+          already in an aggregate that hasn't hit max_size, join
+          that aggregate.
+       c. Otherwise, it becomes its own singleton aggregate.
+
+    Parameters
+    ----------
+    G_nx      : networkx.Graph
+    gamma_in  : list of int
+    gamma_out : list of int
+    max_size  : int -- maximum fine vertices per aggregate
+
+    Returns
+    -------
+    aggregate_of : dict {fine_vertex: coarse_vertex_id}
+    n_coarse     : int -- number of coarse vertices (aggregates)
+    """
+    gamma_in_set = set(gamma_in)
+    gamma_out_set = set(gamma_out)
+    interior_set = set(G_nx.nodes()) - gamma_in_set - gamma_out_set
+
+    aggregate_of = {}
+    agg_sizes = {}
+    next_id = 0
+
+    def process_group(group):
+        nonlocal next_id
+
+        for v in sorted(group, key=lambda v: G_nx.degree(v)):
+            if v in aggregate_of:
+                continue
+
+            # Step (a): look for an unassigned neighbor within the same group
+            partner = next(
+                (n for n in G_nx.neighbors(v)
+                 if n in group and n not in aggregate_of),
+                None,
+            )
+            if partner is not None:
+                aggregate_of[v] = next_id
+                aggregate_of[partner] = next_id
+                agg_sizes[next_id] = 2
+                next_id += 1
+                continue
+
+            # Step (b): look for a neighbor (same group) already in an
+            # aggregate that hasn't hit max_size
+            joined = False
+            for n in G_nx.neighbors(v):
+                if n in group and n in aggregate_of:
+                    aid = aggregate_of[n]
+                    if agg_sizes[aid] < max_size:
+                        aggregate_of[v] = aid
+                        agg_sizes[aid] += 1
+                        joined = True
+                        break
+            if joined:
+                continue
+
+            # Step (c): singleton
+            aggregate_of[v] = next_id
+            agg_sizes[next_id] = 1
+            next_id += 1
+
+    # Process each group independently
+    process_group(gamma_in_set)
+    process_group(gamma_out_set)
+    process_group(interior_set)
+
+    # Relabel to contiguous 0-indexed coarse vertex IDs
+    unique_ids = sorted(set(aggregate_of.values()))
+    relabel = {old: new for new, old in enumerate(unique_ids)}
+    aggregate_of = {v: relabel[a] for v, a in aggregate_of.items()}
+    n_coarse = len(unique_ids)
+
+    return aggregate_of, n_coarse
+
 
 def summarize_aggregation(aggregate_of, n_coarse, gamma_in, gamma_out, verbose=True):
     """

@@ -719,29 +719,22 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
                           N=1000, use_amg=False, debug=True):
     """
     Run the full Monte Carlo Darcy flow pipeline (Phases 3-6) N times.
-
-    Parameters
-    ----------
-    ... (existing params)
-    debug : bool — if True (default), runs sanity checks each sample:
-            (1) NaN/Inf check on the solved interior pressures,
-            (2) maximum-principle bounds check (p in [0,1]).
-            Set to False to skip these checks for a faster production run
-            once correctness has been validated on a given dataset.
+    ... (docstring unchanged)
     """
+    from sksparse.cholmod import cholesky as sparse_cholesky  # ADD THIS
 
     # precompute once
-    B         = build_incidence_matrix(edges, n_vertices)
-    cho_cache = cho_factor(L_sigma)
+    B      = build_incidence_matrix(edges, n_vertices)
+    factor = sparse_cholesky(L_sigma)          # CHANGED from: cho_cache = cho_factor(L_sigma)
     Q_samples = np.zeros(N)
-    # precompute edge arrays for vectorized permeability
+
     edges_arr = np.array(edges)
     i_arr     = edges_arr[:, 0]
     j_arr     = edges_arr[:, 1]
-    # precompute COO structure for L_k — same every step, only data changes
+
     row_idx = np.concatenate([i_arr, j_arr, i_arr, j_arr])
     col_idx = np.concatenate([i_arr, j_arr, j_arr, i_arr])
-    # precompute boundary/interior split once
+
     boundary   = set(gamma_in) | set(gamma_out)
     interior   = np.array([v for v in range(n_vertices)
                            if v not in boundary])
@@ -757,9 +750,11 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
             # Phase 3
             w = np.random.randn(len(edges))
             f = B @ w
-            u = cho_solve(cho_cache, np.sqrt(lambda_min) * f)
+            u = factor.solve_A(np.sqrt(lambda_min) * f)   # CHANGED from: cho_solve(cho_cache, ...)
+
             # Phase 4 — vectorized
             k_vals = np.exp((u[i_arr] + u[j_arr]) / 2)
+
             # Phase 5a — build L_k using precomputed structure
             diag_data = np.concatenate([k_vals, k_vals])
             offdiag_data = np.concatenate([-k_vals, -k_vals])
@@ -770,7 +765,6 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
             # Phase 5b — solve
             L_interior = L_k[interior, :][:, interior]
             rhs        = -L_k[interior, :][:, list(boundary)] @ p_boundary[list(boundary)]
-
             p_interior = spsolve(L_interior, rhs)
 
             if debug:
@@ -801,6 +795,7 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
             outlet_mask = np.array([i in gamma_out_set or j in gamma_out_set
                                     for i,j in edges])
             Q_samples[idx] = np.sum(k_vals[outlet_mask] * p_diff[outlet_mask])
+
             pbar.update(1)
             pbar.set_postfix({"mean Q": f"{Q_samples[:idx+1].mean():.4f}"})
 
@@ -808,7 +803,6 @@ def monte_carlo_loop_tqdm(L_sigma, lambda_min, edges, n_vertices,
     print(f"  Mean Q : {Q_samples.mean():.6f}")
     print(f"  Std Q  : {Q_samples.std():.6f}")
     return Q_samples
-
 
 
 def analyze_qoi(Q_samples, save_as=None):
