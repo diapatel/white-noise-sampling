@@ -11,7 +11,7 @@ machinery.
 -------------------------------------------------------------------
 WHAT THIS FILE DOES NOT CHANGE
 -------------------------------------------------------------------
-No graph-domain logic is altered. Aggregation (build_capped_aggregation),
+No graph-domain logic is altered. Aggregation (build_grouped_aggregation),
 the boundary-fraction precondition, and the sparse-Cholesky solve are
 all preserved exactly as validated in two_level_mc.py / functions_v2.py.
 This file is purely an adapter layer -- it re-packages existing
@@ -57,7 +57,7 @@ from two_level_mc import TwoLevelSetup
 
 @dataclass(frozen=True)
 class GraphModelInput:
-     """
+    """
     One level's sample-dependent data, bundled for a single Monte
     Carlo sample.
  
@@ -211,7 +211,7 @@ class GraphTwoLevelModel:
         fine_level: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """"
+        """
         Draw the shared randomness for one MLMC correction sample, as
         required by the MultilevelModel protocol.
  

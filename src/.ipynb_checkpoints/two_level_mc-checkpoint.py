@@ -96,131 +96,6 @@ def check_boundary_fraction(gamma_in, gamma_out, n_vertices, verbose=True):
 # Aggregation
 # ============================================================
 
-def build_capped_aggregation(G_nx, gamma_in, gamma_out, max_size=10):
-    """
-    Group fine vertices into aggregates (coarse vertices), respecting
-    gamma_in/gamma_out as boundary conditions.
-
-    Design choices, each motivated by a specific failure mode found
-    during development:
-
-    1. Boundary vertices (gamma_in/gamma_out) are processed FIRST, and
-       each is forced to pair with an INTERIOR fine vertex specifically
-       -- never with another boundary vertex, and never left to stand
-       alone. Without this, boundary vertices can end up as their own
-       singleton coarse vertices; if gamma_in+gamma_out is large enough
-       relative to the graph, EVERY coarse vertex can end up being a
-       boundary vertex, leaving zero interior coarse vertices for the
-       Darcy solve (this is exactly what happened on Rhesus Brain).
-
-    2. gamma_in vertices are never allowed to merge with gamma_out
-       vertices (or vice versa) at any point -- a single coarse vertex
-       cannot simultaneously be a fixed source (p=1) and fixed sink (p=0).
-
-    3. Aggregate size is capped at max_size. Uncapped aggregation can
-       let a few aggregates absorb many fine edges' permeability into
-       one coarse edge, inflating Q_coarse by 10-100x relative to
-       Q_fine even after normalization (observed on Rhesus Brain with
-       uncapped aggregation).
-
-    4. Remaining (non-boundary) vertices are processed in order of
-       increasing degree, giving low-degree, few-option vertices first
-       pick of their neighbors.
-
-    Parameters
-    ----------
-    G_nx      : networkx.Graph
-    gamma_in  : list of int
-    gamma_out : list of int
-    max_size  : int -- maximum fine vertices per aggregate
-
-    Returns
-    -------
-    aggregate_of : dict {fine_vertex: coarse_vertex_id}
-    n_coarse     : int -- number of coarse vertices (aggregates)
-    """
-    gamma_in_set = set(gamma_in)
-    gamma_out_set = set(gamma_out)
-    boundary_set = gamma_in_set | gamma_out_set
-
-    aggregate_of = {}
-    agg_sizes = {}
-    agg_has_gamma_in = {}
-    agg_has_gamma_out = {}
-    next_agg_id = 0
-
-    def forbidden_pair(a, b):
-        return (a in gamma_in_set and b in gamma_out_set) or \
-               (a in gamma_out_set and b in gamma_in_set)
-
-    # Step 1: boundary vertices first, forced to pair with an interior neighbor
-    boundary_nodes_by_degree = sorted(boundary_set, key=lambda v: G_nx.degree(v))
-    for v in boundary_nodes_by_degree:
-        if v in aggregate_of:
-            continue
-        partner = None
-        for neighbor in G_nx.neighbors(v):
-            if neighbor not in aggregate_of and neighbor not in boundary_set:
-                partner = neighbor
-                break
-        if partner is not None:
-            aggregate_of[v] = next_agg_id
-            aggregate_of[partner] = next_agg_id
-            agg_sizes[next_agg_id] = 2
-            agg_has_gamma_in[next_agg_id] = v in gamma_in_set
-            agg_has_gamma_out[next_agg_id] = v in gamma_out_set
-            next_agg_id += 1
-        # if no interior neighbor is available, v is picked up in Step 2
-
-    # Step 2: everyone else (interior vertices, plus any leftover boundary vertices)
-    remaining_by_degree = sorted(
-        [v for v in G_nx.nodes() if v not in aggregate_of],
-        key=lambda v: G_nx.degree(v)
-    )
-    for v in remaining_by_degree:
-        if v in aggregate_of:
-            continue
-        partner = None
-        for neighbor in G_nx.neighbors(v):
-            if neighbor not in aggregate_of and not forbidden_pair(v, neighbor):
-                partner = neighbor
-                break
-        if partner is not None:
-            aggregate_of[v] = next_agg_id
-            aggregate_of[partner] = next_agg_id
-            agg_sizes[next_agg_id] = 2
-            agg_has_gamma_in[next_agg_id] = (v in gamma_in_set) or (partner in gamma_in_set)
-            agg_has_gamma_out[next_agg_id] = (v in gamma_out_set) or (partner in gamma_out_set)
-            next_agg_id += 1
-        else:
-            joined = False
-            for neighbor in G_nx.neighbors(v):
-                if neighbor in aggregate_of and not forbidden_pair(v, neighbor):
-                    agg_id = aggregate_of[neighbor]
-                    v_is_in = v in gamma_in_set
-                    v_is_out = v in gamma_out_set
-                    if (v_is_in and agg_has_gamma_out.get(agg_id, False)) or \
-                       (v_is_out and agg_has_gamma_in.get(agg_id, False)):
-                        continue
-                    if agg_sizes[agg_id] < max_size:
-                        aggregate_of[v] = agg_id
-                        agg_sizes[agg_id] += 1
-                        agg_has_gamma_in[agg_id] = agg_has_gamma_in.get(agg_id, False) or v_is_in
-                        agg_has_gamma_out[agg_id] = agg_has_gamma_out.get(agg_id, False) or v_is_out
-                        joined = True
-                        break
-            if not joined:
-                aggregate_of[v] = next_agg_id
-                agg_sizes[next_agg_id] = 1
-                agg_has_gamma_in[next_agg_id] = v in gamma_in_set
-                agg_has_gamma_out[next_agg_id] = v in gamma_out_set
-                next_agg_id += 1
-
-    unique_ids = sorted(set(aggregate_of.values()))
-    relabel = {old: new for new, old in enumerate(unique_ids)}
-    aggregate_of = {v: relabel[a] for v, a in aggregate_of.items()}
-    return aggregate_of, len(unique_ids)
-
 def build_grouped_aggregation(G_nx, gamma_in, gamma_out, max_size=10):
     """
     Aggregate gamma_in with gamma_in, gamma_out with gamma_out, and
@@ -316,7 +191,7 @@ def summarize_aggregation(aggregate_of, n_coarse, gamma_in, gamma_out, verbose=T
     interior coarse vertices remain and whether gamma_in/gamma_out
     overlap at the coarse level.
 
-    Always call this after build_capped_aggregation() and before
+    Always call this after build_grouped_aggregation() and before
     proceeding to build the coarse graph. If interior_coarse is empty,
     STOP -- the Darcy solve will be degenerate. See check_boundary_fraction()
     for how to diagnose why.
@@ -465,14 +340,14 @@ class TwoLevelSetup:
         gamma_in, gamma_out       : from your chosen gamma-selection method
         build_incidence_matrix    : pass in from functions.py
         sparse_cholesky           : pass in `from sksparse.cholmod import cholesky as sparse_cholesky`
-        max_size                  : aggregation cap, see build_capped_aggregation
+        max_size                  : aggregation cap, see build_grouped_aggregation
         """
         check_boundary_fraction(gamma_in, gamma_out, n_vertices, verbose=verbose)
 
         G_nx = nx.Graph()
         G_nx.add_edges_from(edges)
 
-        aggregate_of, n_coarse = build_capped_aggregation(G_nx, gamma_in, gamma_out, max_size=max_size)
+        aggregate_of, n_coarse = build_grouped_aggregation(G_nx, gamma_in, gamma_out, max_size=max_size)
         summary = summarize_aggregation(aggregate_of, n_coarse, gamma_in, gamma_out, verbose=verbose)
 
         if len(summary['interior_coarse']) == 0:
@@ -485,7 +360,7 @@ class TwoLevelSetup:
             raise ValueError(
                 f"gamma_in_coarse and gamma_out_coarse overlap at "
                 f"{summary['overlap']} -- this should not happen given "
-                f"build_capped_aggregation's boundary protection; check "
+                f"build_grouped_aggregation's boundary protection; check "
                 f"for a bug or a modified aggregation function."
             )
 
